@@ -1,0 +1,553 @@
+# ÚNICO arquivo necessário. Crie/atualize em: .github/workflows/build-apk.yml
+# Baixa o hlsdk-portable, injeta o mod (stamina, mira, escadas, HUD azul, sway, soldados v1),
+# compila e gera o APK.
+name: Build APK
+
+on:
+  workflow_dispatch:   # botão "Run workflow" na aba Actions
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar hlsdk-portable
+        uses: actions/checkout@v4
+        with:
+          repository: FWGS/hlsdk-portable
+          submodules: recursive
+
+      - name: Escrever arquivos do mod
+        run: |
+          cat > dlls/stamina.h <<'EOF_FILE'
+          // Sistema de stamina (código original) - lado do servidor
+          #ifndef STAMINA_H
+          #define STAMINA_H
+
+          class CBasePlayer;
+
+          void Stamina_Init( void );                    // fim de LinkUserMessages()
+          void Stamina_Reset( CBasePlayer *pPlayer );   // CBasePlayer::Spawn()
+          void Stamina_Think( CBasePlayer *pPlayer );   // início de CBasePlayer::PreThink()
+
+          #endif // STAMINA_H
+          EOF_FILE
+          cat > dlls/stamina.cpp <<'EOF_FILE'
+          // Sistema de stamina (código original) - lado do servidor
+          // Sprint = botão IN_ALT1 (comando "+alt1"). Sem stamina, o jogador só anda.
+          #include "extdll.h"
+          #include "util.h"
+          #include "cbase.h"
+          #include "player.h"
+          #include "stamina.h"
+
+          int gmsgStamina = 0;
+
+          // Ajustes (valores em unidades/segundo)
+          static const float STAMINA_MAX        = 100.0f;
+          static const float STAMINA_DRAIN      = 20.0f;   // gasto por segundo correndo
+          static const float STAMINA_REGEN      = 12.0f;   // recuperação por segundo
+          static const float STAMINA_REGEN_WAIT = 1.5f;    // pausa após parar de correr
+          static const float STAMINA_RECOVER_AT = 25.0f;   // após esgotar, só corre de novo com isso
+          static const float WALK_SPEED         = 190.0f;
+          static const float SPRINT_SPEED       = 320.0f;
+          static const float MIN_MOVE_SPEED     = 100.0f;  // só gasta se realmente se move
+
+          struct StaminaState
+          {
+          	bool  init;
+          	bool  exhausted;
+          	float value;
+          	float nextRegen;
+          	int   lastSent;   // valor+flag já enviados ao cliente (-1 = nada ainda)
+          };
+
+          static StaminaState g_Stamina[33]; // índices 1..32 (entindex)
+
+          void Stamina_Init( void )
+          {
+          	if ( gmsgStamina )
+          		return;
+
+          	gmsgStamina = REG_USER_MSG( "Stamina", 2 );
+          }
+
+          static StaminaState *GetState( CBasePlayer *pPlayer )
+          {
+          	int idx = ENTINDEX( pPlayer->edict() );
+          	if ( idx < 1 || idx > 32 )
+          		return NULL;
+          	return &g_Stamina[idx];
+          }
+
+          void Stamina_Reset( CBasePlayer *pPlayer )
+          {
+          	StaminaState *s = GetState( pPlayer );
+          	if ( !s )
+          		return;
+
+          	s->init      = true;
+          	s->exhausted = false;
+          	s->value     = STAMINA_MAX;
+          	s->nextRegen = 0.0f;
+          	s->lastSent  = -1;
+          }
+
+          void Stamina_Think( CBasePlayer *pPlayer )
+          {
+          	StaminaState *s = GetState( pPlayer );
+          	if ( !s )
+          		return;
+
+          	if ( !s->init )
+          		Stamina_Reset( pPlayer );
+
+          	entvars_t *pev = pPlayer->pev;
+
+          	if ( !pPlayer->IsAlive() || ( pev->flags & FL_FROZEN ) )
+          		return;
+
+          	const float dt = gpGlobals->frametime;
+          	const bool wantsSprint = ( pev->button & IN_ALT1 ) != 0;
+          	const bool moving      = pev->velocity.Length2D() > MIN_MOVE_SPEED;
+          	const bool sprinting   = wantsSprint && moving && !s->exhausted && s->value > 0.0f;
+
+          	if ( sprinting )
+          	{
+          		s->value -= STAMINA_DRAIN * dt;
+          		s->nextRegen = gpGlobals->time + STAMINA_REGEN_WAIT;
+
+          		if ( s->value <= 0.0f )
+          		{
+          			s->value = 0.0f;
+          			s->exhausted = true;
+          		}
+          	}
+          	else if ( gpGlobals->time >= s->nextRegen )
+          	{
+          		s->value += STAMINA_REGEN * dt;
+          		if ( s->value > STAMINA_MAX )
+          			s->value = STAMINA_MAX;
+
+          		if ( s->exhausted && s->value >= STAMINA_RECOVER_AT )
+          			s->exhausted = false;
+          	}
+
+          	const float speed = sprinting ? SPRINT_SPEED : WALK_SPEED;
+          	pev->maxspeed = speed;
+          	g_engfuncs.pfnSetClientMaxspeed( pPlayer->edict(), speed );
+
+          	// Envia ao HUD só quando o valor inteiro (ou o estado) muda
+          	const int wire = (int)( s->value + 0.5f );
+          	const int key  = wire | ( s->exhausted ? 0x100 : 0 );
+
+          	if ( key != s->lastSent )
+          	{
+          		s->lastSent = key;
+
+          		MESSAGE_BEGIN( MSG_ONE, gmsgStamina, NULL, pev );
+          			WRITE_BYTE( wire );
+          			WRITE_BYTE( s->exhausted ? 1 : 0 );
+          		MESSAGE_END();
+          	}
+          }
+          EOF_FILE
+          cat > dlls/ladder_use.h <<'EOF_FILE'
+          // Escadas: só sobe com +use, e o personagem fica desarmado enquanto estiver nela.
+          #ifndef LADDER_USE_H
+          #define LADDER_USE_H
+
+          class CBasePlayer;
+
+          void LadderUse_Reset( CBasePlayer *pPlayer );   // CBasePlayer::Spawn()
+          void LadderUse_Think( CBasePlayer *pPlayer );   // início de CBasePlayer::PreThink()
+
+          #endif // LADDER_USE_H
+          EOF_FILE
+          cat > dlls/ladder_use.cpp <<'EOF_FILE'
+          // Escadas: só sobe com +use, e o personagem fica desarmado enquanto estiver nela.
+          // A parte do +use fica em pm_shared.c (patch). Aqui é só guardar/devolver a arma.
+          #include "extdll.h"
+          #include "util.h"
+          #include "cbase.h"
+          #include "player.h"
+          #include "weapons.h"
+          #include "ladder_use.h"
+
+          struct LadderState
+          {
+          	bool             onLadder;
+          	CBasePlayerItem *stowed;   // arma guardada (só comparada, nunca usada sem checar)
+          };
+
+          static LadderState g_Ladder[33]; // índices 1..32 (entindex)
+
+          static LadderState *GetState( CBasePlayer *pPlayer )
+          {
+          	int idx = ENTINDEX( pPlayer->edict() );
+          	if ( idx < 1 || idx > 32 )
+          		return NULL;
+          	return &g_Ladder[idx];
+          }
+
+          static bool PlayerOwnsItem( CBasePlayer *pPlayer, CBasePlayerItem *pItem )
+          {
+          	for ( int i = 0; i < MAX_ITEM_TYPES; i++ )
+          	{
+          		for ( CBasePlayerItem *p = pPlayer->m_rgpPlayerItems[i]; p; p = p->m_pNext )
+          		{
+          			if ( p == pItem )
+          				return true;
+          		}
+          	}
+          	return false;
+          }
+
+          void LadderUse_Reset( CBasePlayer *pPlayer )
+          {
+          	LadderState *s = GetState( pPlayer );
+          	if ( !s )
+          		return;
+
+          	s->onLadder = false;
+          	s->stowed   = NULL;
+          }
+
+          void LadderUse_Think( CBasePlayer *pPlayer )
+          {
+          	LadderState *s = GetState( pPlayer );
+          	if ( !s )
+          		return;
+
+          	entvars_t *pev = pPlayer->pev;
+
+          	if ( !pPlayer->IsAlive() )
+          	{
+          		s->onLadder = false;
+          		s->stowed   = NULL;
+          		return;
+          	}
+
+          	// Na escada o jogador fica em MOVETYPE_FLY
+          	const bool onLadder = ( pev->movetype == MOVETYPE_FLY );
+
+          	if ( onLadder )
+          	{
+          		// Guarda a arma na entrada e impede de sacar outra enquanto estiver na escada
+          		if ( pPlayer->m_pActiveItem )
+          		{
+          			if ( !s->stowed )
+          				s->stowed = pPlayer->m_pActiveItem;
+
+          			pPlayer->m_pActiveItem->Holster();
+          			pPlayer->m_pActiveItem = NULL;
+          		}
+
+          		pev->viewmodel   = 0;
+          		pev->weaponmodel = 0;
+          	}
+          	else if ( s->onLadder )
+          	{
+          		// Saiu da escada: saca a arma de volta
+          		if ( s->stowed && !pPlayer->m_pActiveItem && PlayerOwnsItem( pPlayer, s->stowed ) )
+          			pPlayer->SwitchWeapon( s->stowed );
+
+          		s->stowed = NULL;
+          	}
+
+          	s->onLadder = onLadder;
+          }
+          EOF_FILE
+          cat > cl_dll/stamina_hud.h <<'EOF_FILE'
+          // Barra de stamina (código original) - lado do cliente
+          // Incluir em hud.h junto dos outros (health.h, ammo.h...), depois de CHudBase.
+          #ifndef STAMINA_HUD_H
+          #define STAMINA_HUD_H
+
+          class CHudStamina : public CHudBase
+          {
+          public:
+          	virtual int  Init( void );
+          	virtual int  VidInit( void );
+          	virtual int  Draw( float flTime );
+          	virtual void InitHUDData( void );
+
+          	int MsgFunc_Stamina( const char *pszName, int iSize, void *pbuf );
+
+          private:
+          	float m_fraction;   // 0..1
+          	float m_fullSince;  // hora em que encheu (para o fade-out)
+          	bool  m_exhausted;
+          };
+
+          #endif // STAMINA_HUD_H
+          EOF_FILE
+          cat > cl_dll/stamina_hud.cpp <<'EOF_FILE'
+          // Barra de stamina (código original) - lado do cliente
+          #include "hud.h"
+          #include "cl_util.h"
+          #include "parsemsg.h"
+          #include "stamina_hud.h"
+
+          DECLARE_MESSAGE( m_Stamina, Stamina )
+
+          static const float STAMINA_FADE_TIME = 1.0f;
+
+          int CHudStamina::Init( void )
+          {
+          	HOOK_MESSAGE( Stamina );
+
+          	m_iFlags = 0;
+          	InitHUDData();
+          	gHUD.AddHudElem( this );
+          	return 1;
+          }
+
+          int CHudStamina::VidInit( void )
+          {
+          	m_iFlags |= HUD_ACTIVE;
+          	return 1;
+          }
+
+          void CHudStamina::InitHUDData( void )
+          {
+          	m_fraction  = 1.0f;
+          	m_fullSince = 0.0f;
+          	m_exhausted = false;
+          }
+
+          int CHudStamina::MsgFunc_Stamina( const char *pszName, int iSize, void *pbuf )
+          {
+          	BEGIN_READ( pbuf, iSize );
+          	int value = READ_BYTE();
+          	int flags = READ_BYTE();
+
+          	float frac = value / 100.0f;
+          	if ( frac < 0.0f ) frac = 0.0f;
+          	if ( frac > 1.0f ) frac = 1.0f;
+
+          	if ( frac >= 0.999f && m_fraction < 0.999f )
+          		m_fullSince = gHUD.m_flTime;
+
+          	m_fraction  = frac;
+          	m_exhausted = ( flags & 1 ) != 0;
+          	m_iFlags   |= HUD_ACTIVE;
+          	return 1;
+          }
+
+          int CHudStamina::Draw( float flTime )
+          {
+          	if ( gHUD.m_iHideHUDDisplay & ( HIDEHUD_ALL | HIDEHUD_HEALTH ) )
+          		return 1;
+
+          	// Cheia: some devagar. Gastando/recuperando: sempre visível.
+          	float visibility = 1.0f;
+          	if ( m_fraction >= 0.999f )
+          	{
+          		visibility = 1.0f - ( flTime - m_fullSince ) / STAMINA_FADE_TIME;
+          		if ( visibility <= 0.0f )
+          			return 1;
+          	}
+
+          	int w = ScreenWidth / 5;
+          	int h = ScreenHeight / 90;
+          	if ( h < 4 ) h = 4;
+
+          	int x = ( ScreenWidth - w ) / 2;
+          	int y = ScreenHeight - h - ScreenHeight / 12;
+
+          	int r = 230, g = 230, b = 230;
+          	if ( m_exhausted )
+          	{
+          		r = 255; g = 70; b = 70;
+          	}
+
+          	FillRGBA( x - 1, y - 1, w + 2, h + 2, 0, 0, 0, (int)( 110 * visibility ) );
+          	FillRGBA( x, y, (int)( w * m_fraction ), h, r, g, b, (int)( 200 * visibility ) );
+          	return 1;
+          }
+          EOF_FILE
+          cat > cl_dll/viewfx.h <<'EOF_FILE'
+          // Iron sight (mira) + balanço da arma ao mexer a câmera (weapon sway)
+          #ifndef VIEWFX_H
+          #define VIEWFX_H
+
+          struct ref_params_s;
+
+          void  ViewFX_Init( void );                         // CHud::Init()
+          void  ViewFX_Apply( struct ref_params_s *pparams ); // depois de V_CalcNormalRefdef()
+          float ViewFX_ModifyFOV( float fov );               // em CHud::UpdateClientData()
+
+          #endif // VIEWFX_H
+          EOF_FILE
+          cat > cl_dll/viewfx.cpp <<'EOF_FILE'
+          // Iron sight (mira) + balanço da arma ao mexer a câmera (weapon sway)
+          //
+          // Comandos:  +ads / -ads (segurar)   ads (liga/desliga)
+          // Ajustes ao vivo no console (salvos no config):
+          //   cl_ads_right / cl_ads_up / cl_ads_fwd : posição da arma ao mirar
+          //   cl_ads_fov     : fração do FOV ao mirar (0.85 = zoom leve)
+          //   cl_ads_speed   : velocidade de entrar/sair da mira
+          //   cl_sway        : força do balanço (0 desliga)
+          //   cl_sway_max    : deslocamento máximo da arma
+          //   cl_sway_response : rapidez com que a arma acompanha
+          #include "hud.h"
+          #include "cl_util.h"
+          #include "cl_entity.h"
+          #include "ref_params.h"
+          #include "viewfx.h"
+          #include <math.h>
+
+          static bool  g_adsHeld   = false;
+          static float g_adsAmount = 0.0f;   // 0 = quadril, 1 = mirando
+
+          static bool  g_swayInit  = false;
+          static float g_lastYaw   = 0.0f;
+          static float g_lastPitch = 0.0f;
+          static float g_swayX     = 0.0f;   // deslocamento lateral atual
+          static float g_swayY     = 0.0f;   // deslocamento vertical atual
+
+          static cvar_t *cl_ads_right, *cl_ads_up, *cl_ads_fwd, *cl_ads_fov, *cl_ads_speed;
+          static cvar_t *cl_sway, *cl_sway_max, *cl_sway_response;
+
+          static void ADS_Down( void )   { g_adsHeld = true; }
+          static void ADS_Up( void )     { g_adsHeld = false; }
+          static void ADS_Toggle( void ) { g_adsHeld = !g_adsHeld; }
+
+          static float CvarVal( cvar_t *c, float fallback )
+          {
+          	return c ? c->value : fallback;
+          }
+
+          static float Clampf( float v, float lo, float hi )
+          {
+          	return v < lo ? lo : ( v > hi ? hi : v );
+          }
+
+          static float Approach( float cur, float target, float step )
+          {
+          	if ( cur < target ) { cur += step; if ( cur > target ) cur = target; }
+          	else                { cur -= step; if ( cur < target ) cur = target; }
+          	return cur;
+          }
+
+          static float AngleDelta( float a, float b )
+          {
+          	float d = a - b;
+          	while ( d >  180.0f ) d -= 360.0f;
+          	while ( d < -180.0f ) d += 360.0f;
+          	return d;
+          }
+
+          void ViewFX_Init( void )
+          {
+          	cl_ads_right     = gEngfuncs.pfnRegisterVariable( (char *)"cl_ads_right",     (char *)"-3.0", FCVAR_ARCHIVE );
+          	cl_ads_up        = gEngfuncs.pfnRegisterVariable( (char *)"cl_ads_up",        (char *)"1.0",  FCVAR_ARCHIVE );
+          	cl_ads_fwd       = gEngfuncs.pfnRegisterVariable( (char *)"cl_ads_fwd",       (char *)"1.0",  FCVAR_ARCHIVE );
+          	cl_ads_fov       = gEngfuncs.pfnRegisterVariable( (char *)"cl_ads_fov",       (char *)"0.85", FCVAR_ARCHIVE );
+          	cl_ads_speed     = gEngfuncs.pfnRegisterVariable( (char *)"cl_ads_speed",     (char *)"8.0",  FCVAR_ARCHIVE );
+          	cl_sway          = gEngfuncs.pfnRegisterVariable( (char *)"cl_sway",          (char *)"1.0",  FCVAR_ARCHIVE );
+          	cl_sway_max      = gEngfuncs.pfnRegisterVariable( (char *)"cl_sway_max",      (char *)"3.0",  FCVAR_ARCHIVE );
+          	cl_sway_response = gEngfuncs.pfnRegisterVariable( (char *)"cl_sway_response", (char *)"12.0", FCVAR_ARCHIVE );
+
+          	gEngfuncs.pfnAddCommand( (char *)"+ads", ADS_Down );
+          	gEngfuncs.pfnAddCommand( (char *)"-ads", ADS_Up );
+          	gEngfuncs.pfnAddCommand( (char *)"ads",  ADS_Toggle );
+          }
+
+          void ViewFX_Apply( struct ref_params_s *pparams )
+          {
+          	cl_entity_t *vm = gEngfuncs.GetViewModel();
+          	const float dt  = pparams->frametime;
+
+          	if ( !vm || dt <= 0.0f || pparams->paused )
+          		return;
+
+          	// Sem arma na mão (ex.: na escada) não mira
+          	const bool hasWeapon = ( vm->model != NULL );
+
+          	// ---- mira (ADS)
+          	const float target = ( g_adsHeld && hasWeapon && !pparams->intermission ) ? 1.0f : 0.0f;
+          	g_adsAmount = Approach( g_adsAmount, target, dt * CvarVal( cl_ads_speed, 8.0f ) );
+
+          	// ---- balanço: a arma "atrasa" em relação à câmera
+          	const float yaw   = pparams->cl_viewangles[1];
+          	const float pitch = pparams->cl_viewangles[0];
+
+          	if ( !g_swayInit )
+          	{
+          		g_lastYaw   = yaw;
+          		g_lastPitch = pitch;
+          		g_swayInit  = true;
+          	}
+
+          	const float yawRate   = AngleDelta( yaw,   g_lastYaw )   / dt;  // graus/s
+          	const float pitchRate = AngleDelta( pitch, g_lastPitch ) / dt;
+          	g_lastYaw   = yaw;
+          	g_lastPitch = pitch;
+
+          	const float k   = 0.02f * CvarVal( cl_sway, 1.0f );
+          	const float max = CvarVal( cl_sway_max, 3.0f );
+
+          	// Vira pra esquerda (yaw sobe) -> arma vai pra direita. Olha pra cima (pitch cai) -> arma desce.
+          	const float tx = Clampf( yawRate   * k, -max, max );
+          	const float ty = Clampf( pitchRate * k, -max, max );
+
+          	const float f = 1.0f - expf( -dt * CvarVal( cl_sway_response, 12.0f ) );
+          	g_swayX += ( tx - g_swayX ) * f;
+          	g_swayY += ( ty - g_swayY ) * f;
+
+          	const float swayScale = 1.0f - 0.7f * g_adsAmount; // mirando, balança menos
+
+          	const float dR = g_swayX * swayScale + CvarVal( cl_ads_right, -3.0f ) * g_adsAmount;
+          	const float dU = g_swayY * swayScale + CvarVal( cl_ads_up,     1.0f ) * g_adsAmount;
+          	const float dF =                       CvarVal( cl_ads_fwd,    1.0f ) * g_adsAmount;
+
+          	for ( int i = 0; i < 3; i++ )
+          		vm->origin[i] += pparams->right[i] * dR + pparams->up[i] * dU + pparams->forward[i] * dF;
+          }
+
+          float ViewFX_ModifyFOV( float fov )
+          {
+          	if ( g_adsAmount <= 0.0f )
+          		return fov;
+
+          	return fov * ( 1.0f - g_adsAmount * ( 1.0f - CvarVal( cl_ads_fov, 0.85f ) ) );
+          }
+          EOF_FILE
+
+      - name: Aplicar patch no código do HLSDK
+        run: |
+          cat > apply_mod.py <<'EOF_PY'
+          import re, sys, pathlib
+
+          failed = []
+
+          def patch(path, pattern, repl, label, count=1, soft=False, flags=0):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  (print if soft else failed.append)(f"{label}: {path} não existe" if not soft else f"aviso  {label}: {path} não existe")
+                  return False
+              s = p.read_text(encoding="utf-8", errors="replace")
+              new, n = re.subn(pattern, repl, s, count=count, flags=flags)
+              if n == 0:
+                  msg = f"{label}: trecho não encontrado em {path}"
+                  if soft:
+                      print("aviso ", msg)
+                  else:
+                      failed.append(msg)
+                  return False
+              p.write_text(new, encoding="utf-8")
+              print("ok   ", label)
+              return True
+
+          def after(text):
+              return lambda m: m.group(1) + text
+
+          # ============ SERVIDOR (dlls/player.cpp)
+          patch("dlls/player.cpp", r'(#include\s+"player\.h"[^\n]*\n)',
+                after('#include "stamina.h"\n#include "ladder_use.h"\n'), "player.cpp includes")
+          patch("dlls/player.cpp", r'(void\s+LinkUserMessages\s*\([^)]*\)\s*\{)',
+                after("\n\tStamina_Init();"), "LinkUserMessages")
+          patch("dlls/player.cpp", r'(void\s+CBasePlayer\s*::\s*Spawn\s*\([^)]*\)\s*\{)',
+                after("\n\tStamina_Reset( this );\n\tLadderUse_Reset( this );"), "CBasePlayer::Spawn")
+          patch("dlls/player.cpp", r'(void\s+CBasePlayer\s*::\s*PreThink\s*\([^)]*\
